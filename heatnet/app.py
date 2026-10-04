@@ -2,8 +2,8 @@
 
 ``Platform`` 把热源、一次网、换热站、二次网、阀门、泵、曲线、定压、热量与审计
 按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、投运、调度、
-停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环每个周期推进热源
-与二次网、把一次网跟随上去、落审计并采集趋势。
+停运、拆分、定压改造、基线反演）、控制循环、并发探测与状态快照。控制循环每个
+周期推进热源与二次网、把一次网跟随上去、落审计并采集趋势。
 """
 
 from __future__ import annotations
@@ -33,7 +33,16 @@ from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
-from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
+from .sequence import (
+    advance_heating,
+    collect_flow_sample,
+    confirm_flow_baseline,
+    dispatch_demand,
+    invert_flow_baseline,
+    recalibrate_flow,
+    shutdown_plant,
+    startup_plant,
+)
 from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
@@ -97,7 +106,7 @@ class Platform:
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
         self.source = HeatSource(self.config.source)
-        self.network = PrimaryNetwork(self.config.primary)
+        self.network = PrimaryNetwork(self.config.primary, self.config.inversion)
         self.secondary = SecondaryLoop(self.config.secondary)
         self._build_zones()
         self.mapping = StationMapping(self.zones)
@@ -181,12 +190,15 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、基线代际链与阀门开度。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        baseline_doc = self.durable.load("primary_baseline")
+        if baseline_doc:
+            self.network.restore_baseline(baseline_doc)
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -209,6 +221,11 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def _persist_baseline(self) -> None:
+        """落盘基线代际链与滑动窗口，供重启后按同一代继续判联锁。"""
+
+        self.durable.save("primary_baseline", self.network.baseline_registry().as_dict())
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -405,10 +422,11 @@ class Platform:
             return {**report, **summary}
 
     def calibrate_flow(self, measured_t_h: float) -> dict:
-        """按实测流量重新标定一次网基线。"""
+        """按实测流量重新标定一次网基线（落一代人工代）。"""
 
         with self._lock:
-            report = recalibrate_flow(self.network, measured_t_h)
+            report = recalibrate_flow(self.network, measured_t_h, self.clock.now())
+            self._persist_baseline()
             self.bus.publish(
                 Event.of(
                     "primary",
@@ -416,6 +434,79 @@ class Platform:
                     "flow_recalibrated",
                     severity="notice",
                     message="一次网流量基线重新标定",
+                    **report,
+                )
+            )
+            return report
+
+    def collect_flow_sample(
+        self,
+        total_t_h: float | None = None,
+        station_flows: dict | None = None,
+        station: str = "console",
+    ) -> dict:
+        """把一次实测（总流量 + 各站分配）接进反演滑动窗口。"""
+
+        with self._lock:
+            report = collect_flow_sample(
+                self.network,
+                sorted(self.stations),
+                total_t_h,
+                station_flows or {},
+                self.clock.now(),
+            )
+            self._persist_baseline()
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "flow_sample",
+                    severity="notice" if report["complete"] else "warning",
+                    message="一次网流量实测样本"
+                    if report["complete"]
+                    else f"一次网流量实测样本缺项: {report['missing']}",
+                    station=station,
+                    **report,
+                )
+            )
+            return report
+
+    def invert_flow_baseline(self, origin: str = "console") -> dict:
+        """按滑动窗口反演一轮基线；部分失败时本轮不换代。"""
+
+        with self._lock:
+            report = invert_flow_baseline(
+                self.network, sorted(self.stations), self.clock.now(), origin
+            )
+            self._persist_baseline()
+            payload = {key: value for key, value in report.items() if key != "steps"}
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "inversion_round",
+                    severity="notice" if report["ok"] else "warning",
+                    message="一次网基线反演完成"
+                    if report["ok"]
+                    else "一次网基线反演部分失败：本轮不换代",
+                    **payload,
+                )
+            )
+            return report
+
+    def confirm_flow_baseline(self, accept: bool = True, operator: str = "shift-lead") -> dict:
+        """人工确认或拒绝挂起的基线代；确认后联锁即刻按新代判。"""
+
+        with self._lock:
+            report = confirm_flow_baseline(self.network, accept, operator, self.clock.now())
+            self._persist_baseline()
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "baseline_confirmed" if accept else "baseline_rejected",
+                    severity="notice",
+                    message=f"{operator} 确认基线换代" if accept else f"{operator} 拒绝基线换代",
                     **report,
                 )
             )
@@ -748,6 +839,35 @@ class Platform:
         ]
         return payload
 
+    def baseline_report(self) -> dict:
+        """返回一次网基线代际报告：现役代、挂起代、整条代际链与滑动窗口。"""
+
+        registry = self.network.baseline_registry()
+        active = registry.active()
+        pending = registry.pending()
+        return {
+            "loop": registry.loop(),
+            "policy": registry.policy(),
+            "policies": {
+                "default": self.config.inversion.default_policy,
+                "loops": dict(self.config.inversion.loop_policies),
+            },
+            "window": registry.window_status(),
+            "conflict_band_t_h": round(self.config.inversion.conflict_band_t_h, 2),
+            "station_sum_tolerance_t_h": round(
+                self.config.inversion.station_sum_tolerance_t_h, 2
+            ),
+            "rounds": registry.rounds(),
+            "interlock_generation": active.generation,
+            "migration_in_progress": pending is not None,
+            "active": active.as_dict(),
+            "pending": None if pending is None else pending.as_dict(),
+            "generations": [generation.as_dict() for generation in registry.generations()],
+            "baseline_t_h": round(self.network.baseline_t_h(), 2),
+            "threshold_t_h": round(self.network.threshold_t_h(), 2),
+            "low_flow": self.network.low_flow(),
+        }
+
     def quota_report(self) -> dict:
         """返回热量表与配额总账报告。"""
 
@@ -790,6 +910,12 @@ class Platform:
             "primary": {
                 **self.network.snapshot().as_dict(),
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),
+                "pending_generation": (
+                    None
+                    if self.network.baseline_registry().pending() is None
+                    else self.network.baseline_registry().pending().generation
+                ),
+                "baseline_policy": self.network.baseline_registry().policy(),
             },
             "secondary": self.secondary.snapshot().as_dict(),
             "pressure": self.pressure_report(),

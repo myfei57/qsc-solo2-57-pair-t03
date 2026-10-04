@@ -15,6 +15,7 @@ class NetworkSnapshot:
     baseline_t_h: float
     threshold_t_h: float
     low_flow: bool
+    generation: int
     recalibrations: int
     dispatches: int
 
@@ -26,6 +27,7 @@ class NetworkSnapshot:
             "baseline_t_h": round(self.baseline_t_h, 2),
             "threshold_t_h": round(self.threshold_t_h, 2),
             "low_flow": self.low_flow,
+            "generation": self.generation,
             "recalibrations": self.recalibrations,
             "dispatches": self.dispatches,
         }

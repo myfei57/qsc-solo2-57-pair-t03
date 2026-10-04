@@ -4,8 +4,9 @@
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
-            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+            控制周期 → 流量标定 → 基线反演 → 定压改造 → 二次网循环 →
+            热量采集与结算 → 分区拆分 → 阀门队列回放 → 停机与复位），
+            用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -31,6 +32,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/audit",
     "/api/stations",
     "/api/quota",
+    "/api/primary/baseline",
 )
 
 
@@ -87,6 +89,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     dispatch = platform.dispatch(args.demand_pct, args.target_c, None, None)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     calibration = platform.calibrate_flow(args.baseline_t_h)
+    # 反演演示：按滑动窗口喂满实测样本（总量与各站分配对得上），再反演一轮。
+    station_names = sorted(platform.stations)
+    per_station = args.baseline_t_h / len(station_names)
+    samples = [
+        platform.collect_flow_sample(
+            args.baseline_t_h, {name: per_station for name in station_names}, "demo-operator"
+        )
+        for _ in range(platform.config.inversion.window_size)
+    ]
+    inversion = platform.invert_flow_baseline("demo-operator")
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
@@ -117,6 +129,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "calibration": calibration,
+        "samples_collected": len(samples),
+        "inversion": {
+            key: inversion[key]
+            for key in (
+                "ok",
+                "decision",
+                "policy",
+                "candidate_baseline_t_h",
+                "recommended_threshold_t_h",
+                "active_generation",
+                "active_baseline_t_h",
+                "active_threshold_t_h",
+            )
+        },
         "retrofit": retrofit,
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
         "heat": heat,
@@ -138,6 +164,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ("weather", weather),
         ("launch", launch),
         ("dispatch", dispatch),
+        ("inversion", inversion),
         ("secondary", secondary),
         ("retrofit", retrofit),
         ("concurrency", concurrency),

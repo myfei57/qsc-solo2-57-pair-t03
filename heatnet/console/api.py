@@ -48,6 +48,7 @@ class Api:
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
+        add("GET", "/api/primary/baseline", lambda params, body: self._platform.baseline_report())
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
         add("GET", "/api/trend", self._trend)
@@ -65,6 +66,9 @@ class Api:
         add("POST", "/api/dispatch", self._dispatch)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
+        add("POST", "/api/primary/sample", self._flow_sample)
+        add("POST", "/api/primary/invert", self._invert)
+        add("POST", "/api/primary/baseline/confirm", self._confirm_baseline)
         add("POST", "/api/retrofit", self._retrofit)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
@@ -289,6 +293,29 @@ class Api:
     def _calibrate(self, params: dict, body: dict) -> dict:
         measured = _as_float(body, "measured_t_h", self._platform.network.baseline_t_h())
         return self._platform.calibrate_flow(measured)
+
+    def _flow_sample(self, params: dict, body: dict) -> dict:
+        stations = body.get("stations") or {}
+        if not isinstance(stations, dict):
+            raise PlantError("参数 'stations' 必须是映射", component="console")
+        flows = {
+            str(name): (None if value is None else _as_float(stations, name, 0.0))
+            for name, value in stations.items()
+        }
+        total = body.get("total_t_h")
+        return self._platform.collect_flow_sample(
+            None if total is None else _as_float(body, "total_t_h", 0.0),
+            flows,
+            str(body.get("station", "console")),
+        )
+
+    def _invert(self, params: dict, body: dict) -> dict:
+        return self._platform.invert_flow_baseline(str(body.get("origin", "console")))
+
+    def _confirm_baseline(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_flow_baseline(
+            bool(body.get("accept", True)), str(body.get("operator", "console"))
+        )
 
     def _retrofit(self, params: dict, body: dict) -> dict:
         target = _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())

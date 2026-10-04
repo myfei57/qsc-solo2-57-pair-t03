@@ -2,9 +2,10 @@
 
 配置来自 JSON 文件（标准库解析），覆盖热源供温带与调质确认时间、供热曲线的
 室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线与
-调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、定压基线范围与
-热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
-:class:`ConfigError`，不允许带着半份配置启动控制链。
+调度速率、基线反演的滑动窗口与回路策略、二次网补水定压带、阀门行程公差、
+循环泵升速斜率、定压基线范围与热量表回绕阈值，以及状态存储目录。任何缺失
+或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份配置启动
+控制链。
 """
 
 from __future__ import annotations
@@ -38,6 +39,29 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     if minimum is not None and number < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
     return number
+
+
+def _integer(section: Mapping[str, Any], key: str, *, minimum: int | None = None) -> int:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"配置字段 {key!r} 必须是整数", component="config")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
+    return value
+
+
+# 反演冲突的处置策略：auto 直接采用反演值，manual 挂起等人工确认。
+POLICIES = ("auto", "manual")
+
+
+def _policy_text(value: object, key: str) -> str:
+    if not isinstance(value, str) or value not in POLICIES:
+        raise ConfigError(
+            f"配置字段 {key!r} 必须是 {'/'.join(POLICIES)} 之一", component="config"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -159,6 +183,47 @@ class PrimaryLimits:
         """按当前基线给出低流量联锁门限。"""
 
         return float(baseline_t_h) - self.flow_tolerance_t_h
+
+
+@dataclass(frozen=True)
+class InversionLimits:
+    """基线反演的滑动窗口、冲突带与按回路定的冲突处置策略。"""
+
+    window_size: int
+    conflict_band_t_h: float
+    station_sum_tolerance_t_h: float
+    default_policy: str
+    loop_policies: dict[str, str]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "InversionLimits":
+        raw_loops = section.get("loop_policies", _MISSING)
+        if raw_loops is _MISSING:
+            raise ConfigError("配置缺少字段 'loop_policies'", component="config")
+        if not isinstance(raw_loops, Mapping):
+            raise ConfigError("配置字段 'loop_policies' 必须是映射", component="config")
+        loop_policies = {
+            str(loop): _policy_text(policy, "loop_policies")
+            for loop, policy in raw_loops.items()
+        }
+        return cls(
+            window_size=_integer(section, "window_size", minimum=2),
+            conflict_band_t_h=_number(section, "conflict_band_t_h", minimum=0.1),
+            station_sum_tolerance_t_h=_number(section, "station_sum_tolerance_t_h", minimum=0.1),
+            default_policy=_policy_text(section.get("default_policy"), "default_policy"),
+            loop_policies=loop_policies,
+        )
+
+    def policy_for(self, loop: str) -> str:
+        """返回某回路的冲突处置策略，未单独配置时取默认值。"""
+
+        return self.loop_policies.get(str(loop), self.default_policy)
+
+
+def default_inversion() -> InversionLimits:
+    """内置默认反演约束：12 次实测一窗，冲突一律人工确认。"""
+
+    return InversionLimits(12, 60.0, 30.0, "manual", {"primary": "manual"})
 
 @dataclass(frozen=True)
 class SecondaryLimits:
@@ -286,6 +351,7 @@ class PlatformConfig:
     curve: CurveLimits
     station: StationLimits
     primary: PrimaryLimits
+    inversion: InversionLimits
     secondary: SecondaryLimits
     valve: ValveLimits
     pump: PumpLimits
@@ -310,6 +376,7 @@ class PlatformConfig:
             curve=CurveLimits.from_mapping(_section(limits, "curve")),
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
+            inversion=InversionLimits.from_mapping(_section(limits, "inversion")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
             valve=ValveLimits.from_mapping(_section(limits, "valve")),
             pump=PumpLimits.from_mapping(_section(limits, "pump")),
@@ -340,6 +407,7 @@ def default_config() -> PlatformConfig:
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
+        inversion=default_inversion(),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
@@ -380,6 +448,13 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_baseline_t_h": cfg.primary.flow_baseline_t_h,
                 "flow_tolerance_t_h": cfg.primary.flow_tolerance_t_h,
                 "dispatch_rate_pct_s": cfg.primary.dispatch_rate_pct_s,
+            },
+            "inversion": {
+                "window_size": cfg.inversion.window_size,
+                "conflict_band_t_h": cfg.inversion.conflict_band_t_h,
+                "station_sum_tolerance_t_h": cfg.inversion.station_sum_tolerance_t_h,
+                "default_policy": cfg.inversion.default_policy,
+                "loop_policies": dict(cfg.inversion.loop_policies),
             },
             "secondary": {
                 "makeup_target_kpa": cfg.secondary.makeup_target_kpa,

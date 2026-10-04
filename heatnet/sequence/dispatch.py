@@ -38,12 +38,13 @@ def dispatch_demand(
     }
 
 
-def recalibrate_flow(network: PrimaryNetwork, measured_t_h: float) -> dict:
-    """按实测流量重新标定一次网基线。"""
+def recalibrate_flow(network: PrimaryNetwork, measured_t_h: float, now: float = 0.0) -> dict:
+    """按实测流量重新标定一次网基线（落一代人工代）。"""
 
-    baseline = network.recalibrate(measured_t_h)
+    baseline = network.recalibrate(measured_t_h, now)
     return {
         "baseline_t_h": round(baseline, 2),
         "threshold_t_h": round(network.threshold_t_h(), 2),
         "recalibrations": network.recalibrations(),
+        "generation": network.baseline_registry().active().generation,
     }

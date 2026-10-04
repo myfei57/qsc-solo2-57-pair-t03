@@ -4,6 +4,7 @@
 
 - 投运：气象推送 → **曲线更新** → 热源调质 → 调量 → 一次网跟随 → 补水定压 → 循环；
 - 调度：按分区排优先级 → 一次网按站分配流量 → 换热站批量下发；
+- 反演：实测样本进滑动窗口 → 按窗口反演基线 → 按回路策略换代或挂起 → 人工确认；
 - 停运：先停泵再关阀 → 撤销一次网流量 → 热源停机。
 
 顺序被破坏时报告里的 ``violations`` 会点出来，由平台写审计。
@@ -13,7 +14,17 @@ from __future__ import annotations
 
 from .dispatch import dispatch_demand, recalibrate_flow
 from .heating import advance_heating
+from .inversion import collect_flow_sample, confirm_flow_baseline, invert_flow_baseline
 from .shutdown import shutdown_plant
 from .startup import startup_plant
 
-__all__ = ["advance_heating", "dispatch_demand", "recalibrate_flow", "shutdown_plant", "startup_plant"]
+__all__ = [
+    "advance_heating",
+    "collect_flow_sample",
+    "confirm_flow_baseline",
+    "dispatch_demand",
+    "invert_flow_baseline",
+    "recalibrate_flow",
+    "shutdown_plant",
+    "startup_plant",
+]
