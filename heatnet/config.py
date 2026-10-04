@@ -1,10 +1,10 @@
 """平台配置。
 
 配置来自 JSON 文件（标准库解析），覆盖热源供温带与调质确认时间、供热曲线的
-室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线与
-调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、定压基线范围与
-热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
-:class:`ConfigError`，不允许带着半份配置启动控制链。
+室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线、
+基线反演策略与调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、
+定压基线范围与热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在
+装配阶段抛出 :class:`ConfigError`，不允许带着半份配置启动控制链。
 """
 
 from __future__ import annotations
@@ -38,6 +38,17 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     if minimum is not None and number < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
     return number
+
+
+def _choice(section: Mapping[str, Any], key: str, choices: tuple[str, ...]) -> str:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(
+            f"配置字段 {key!r} 必须是 {'/'.join(choices)} 之一", component="config"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -136,13 +147,24 @@ class StationLimits:
 
         return abs(float(temperature_c) - self.setpoint_c) <= self.setpoint_band_c
 
+# 基线反演的冲突裁决策略：自动采用反演值，或挂起等人工确认。
+BASELINE_ADOPTIONS = ("auto", "manual")
+
+
 @dataclass(frozen=True)
 class PrimaryLimits:
-    """一次网流量基线、容差与调度速率。"""
+    """一次网流量基线、容差、基线反演策略与调度速率。
+
+    ``baseline_adoption`` 是本回路自己的冲突裁决策略：反演候选与现役基线偏差
+    越容差时，``auto`` 直接采用反演值换代，``manual`` 挂起等新代人工确认。
+    ``baseline_window`` 是反演滑动窗口长度（有效样本轮数）。
+    """
 
     flow_baseline_t_h: float
     flow_tolerance_t_h: float
     dispatch_rate_pct_s: float
+    baseline_adoption: str
+    baseline_window: int
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "PrimaryLimits":
@@ -150,6 +172,8 @@ class PrimaryLimits:
             flow_baseline_t_h=_number(section, "flow_baseline_t_h", minimum=1.0),
             flow_tolerance_t_h=_number(section, "flow_tolerance_t_h", minimum=0.1),
             dispatch_rate_pct_s=_number(section, "dispatch_rate_pct_s", minimum=0.1),
+            baseline_adoption=_choice(section, "baseline_adoption", BASELINE_ADOPTIONS),
+            baseline_window=int(_number(section, "baseline_window", minimum=1.0)),
         )
         if limits.flow_tolerance_t_h >= limits.flow_baseline_t_h:
             raise ConfigError("流量容差必须小于基线", component="config")
@@ -339,7 +363,7 @@ def default_config() -> PlatformConfig:
         source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
-        primary=PrimaryLimits(2400.0, 180.0, 4.0),
+        primary=PrimaryLimits(2400.0, 180.0, 4.0, "manual", 8),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
@@ -380,6 +404,8 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_baseline_t_h": cfg.primary.flow_baseline_t_h,
                 "flow_tolerance_t_h": cfg.primary.flow_tolerance_t_h,
                 "dispatch_rate_pct_s": cfg.primary.dispatch_rate_pct_s,
+                "baseline_adoption": cfg.primary.baseline_adoption,
+                "baseline_window": cfg.primary.baseline_window,
             },
             "secondary": {
                 "makeup_target_kpa": cfg.secondary.makeup_target_kpa,

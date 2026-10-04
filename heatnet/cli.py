@@ -4,8 +4,9 @@
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
-            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+            控制周期 → 流量标定 → 基线反演与裁决 → 定压改造 → 二次网循环 →
+            热量采集与结算 → 分区拆分 → 阀门队列回放 → 停机与复位），用于
+            交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -87,6 +88,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     dispatch = platform.dispatch(args.demand_pct, args.target_c, None, None)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     calibration = platform.calibrate_flow(args.baseline_t_h)
+    # 基线反演演示：第一轮实测与现役基线同工况（无冲突直接生效），第二轮把
+    # 实测整体抬高一半（越容差，manual 回路挂起待确认），最后人工确认换代。
+    readings = [
+        {"station": flow["station"], "flow_t_h": flow["flow_t_h"], "demand_pct": flow["target_pct"]}
+        for flow in dispatch["flows"]
+    ]
+    inversion = platform.invert_baseline(dispatch["flow_t_h"], readings, "demo-operator")
+    drifted = [dict(item, flow_t_h=item["flow_t_h"] * 1.5) for item in readings]
+    conflict = platform.invert_baseline(dispatch["flow_t_h"] * 1.5, drifted, "demo-operator")
+    decision = platform.decide_baseline(True, "demo-operator")
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
@@ -117,6 +128,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "calibration": calibration,
+        "inversion": inversion,
+        "conflict": conflict,
+        "decision": decision,
         "retrofit": retrofit,
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
         "heat": heat,

@@ -48,6 +48,7 @@ class Api:
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
+        add("GET", "/api/primary/baseline", lambda params, body: self._platform.baseline_report())
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
         add("GET", "/api/trend", self._trend)
@@ -65,6 +66,8 @@ class Api:
         add("POST", "/api/dispatch", self._dispatch)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
+        add("POST", "/api/primary/baseline/invert", self._invert_baseline)
+        add("POST", "/api/primary/baseline/decide", self._decide_baseline)
         add("POST", "/api/retrofit", self._retrofit)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
@@ -289,6 +292,23 @@ class Api:
     def _calibrate(self, params: dict, body: dict) -> dict:
         measured = _as_float(body, "measured_t_h", self._platform.network.baseline_t_h())
         return self._platform.calibrate_flow(measured)
+
+    def _invert_baseline(self, params: dict, body: dict) -> dict:
+        stations = body.get("stations") or []
+        if not isinstance(stations, list):
+            raise PlantError("参数 'stations' 必须是列表", component="console")
+        total = body.get("total_flow_t_h")
+        return self._platform.invert_baseline(
+            None if total is None else _as_float(body, "total_flow_t_h", 0.0),
+            [dict(item) if isinstance(item, dict) else {} for item in stations],
+            str(body.get("station", "console")),
+        )
+
+    def _decide_baseline(self, params: dict, body: dict) -> dict:
+        accept = body.get("accept", True)
+        if isinstance(accept, str):
+            accept = accept.strip().lower() in ("1", "true", "yes", "confirm")
+        return self._platform.decide_baseline(bool(accept), str(body.get("operator", "shift-lead")))
 
     def _retrofit(self, params: dict, body: dict) -> dict:
         target = _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())

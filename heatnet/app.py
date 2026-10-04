@@ -2,8 +2,8 @@
 
 ``Platform`` 把热源、一次网、换热站、二次网、阀门、泵、曲线、定压、热量与审计
 按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、投运、调度、
-停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环每个周期推进热源
-与二次网、把一次网跟随上去、落审计并采集趋势。
+停运、拆分、定压改造、基线反演与裁决）、控制循环、并发探测与状态快照。控制循环
+每个周期推进热源与二次网、把一次网跟随上去、落审计并采集趋势。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
 from .pressure.baseline import PressureBaseline
 from .pressure.control import PressurisingController
+from .primary.baseline import Migration, StationReading
 from .primary.flow import batch_flows
 from .primary.network import PrimaryNetwork
 from .pump.curve import PumpCurve
@@ -65,6 +66,14 @@ _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 
 # 热量表按站登记，回绕阈值取配置值。
 _METER_SUFFIX = ".heat-meter"
+
+
+def _optional_number(value: object) -> float | None:
+    """把实测输入转成数值；``None`` 原样保留，表示该路实测缺失。"""
+
+    if value is None:
+        return None
+    return float(value)
 
 
 class Platform:
@@ -181,12 +190,15 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、基线代际账与阀门开度。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        baseline_state = self.store.read("primary_baseline")
+        if isinstance(baseline_state, dict):
+            self.network.restore_baseline(baseline_state)
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -209,6 +221,11 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def _persist_baseline(self) -> None:
+        """落盘基线代际账，供重启后联锁仍按现役代判。"""
+
+        self.store.write("primary_baseline", self.network.export_baseline())
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -405,10 +422,10 @@ class Platform:
             return {**report, **summary}
 
     def calibrate_flow(self, measured_t_h: float) -> dict:
-        """按实测流量重新标定一次网基线。"""
+        """按实测流量重新标定一次网基线（强制换代）。"""
 
         with self._lock:
-            report = recalibrate_flow(self.network, measured_t_h)
+            report = recalibrate_flow(self.network, measured_t_h, self.clock.now())
             self.bus.publish(
                 Event.of(
                     "primary",
@@ -419,7 +436,151 @@ class Platform:
                     **report,
                 )
             )
+            self._persist_baseline()
             return report
+
+    def invert_baseline(
+        self,
+        total_flow_t_h: float | None,
+        stations: list[dict],
+        station: str = "console",
+    ) -> dict:
+        """用实测总流量与各站分配反演一轮一次网基线。
+
+        任何一路实测缺失或总分对不上都算部分失败：本轮只落审计，不产代、
+        不换代；完整轮次产一代，是否立即生效按本回路的冲突裁决策略。
+        """
+
+        with self._lock:
+            readings = [
+                StationReading(
+                    station=str(item.get("station", "")),
+                    flow_t_h=_optional_number(item.get("flow_t_h")),
+                    demand_pct=_optional_number(item.get("demand_pct")),
+                )
+                for item in stations
+            ]
+            outcome = self.network.invert(total_flow_t_h, readings, self.clock.now())
+            report = {
+                "ok": outcome.round.ok,
+                "operator": station,
+                **outcome.as_dict(),
+                "active_generation": self.network.generation(),
+                "baseline_t_h": round(self.network.baseline_t_h(), 2),
+                "threshold_t_h": round(self.network.threshold_t_h(), 2),
+            }
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "baseline_round",
+                    severity="notice" if outcome.round.ok else "warning",
+                    message=(
+                        "一次网基线反演"
+                        if outcome.round.ok
+                        else f"一次网基线反演部分失败：{outcome.round.reason}"
+                    ),
+                    decision=outcome.decision,
+                    reason=outcome.round.reason,
+                    missing=list(outcome.round.missing),
+                    implied_t_h=outcome.round.as_dict()["implied_t_h"],
+                    imbalance_t_h=round(outcome.round.imbalance_t_h, 2),
+                )
+            )
+            if outcome.generation is not None:
+                self.bus.publish(
+                    Event.of(
+                        "primary",
+                        "primary",
+                        "baseline_generation",
+                        severity="notice",
+                        message=f"基线第 {outcome.generation.index} 代出炉",
+                        **outcome.generation.as_dict(),
+                    )
+                )
+            if outcome.migration is not None:
+                self._publish_migration(outcome.migration)
+            if outcome.decision == "pending" and outcome.generation is not None:
+                self.bus.publish(
+                    Event.of(
+                        "primary",
+                        "primary",
+                        "baseline_pending",
+                        severity="warning",
+                        message=f"基线第 {outcome.generation.index} 代与现役冲突，待人工确认",
+                        **outcome.generation.as_dict(),
+                    )
+                )
+            self._persist_baseline()
+            return report
+
+    def decide_baseline(self, accept: bool, operator: str = "shift-lead") -> dict:
+        """人工裁决待确认的基线代：确认即迁移生效，否决即作废。"""
+
+        with self._lock:
+            decision = self.network.decide_baseline(bool(accept))
+            report = {
+                "ok": True,
+                "operator": operator,
+                **decision.as_dict(),
+                "active_generation": self.network.generation(),
+                "baseline_t_h": round(self.network.baseline_t_h(), 2),
+                "threshold_t_h": round(self.network.threshold_t_h(), 2),
+            }
+            self.bus.publish(
+                Event.of(
+                    "primary",
+                    "primary",
+                    "baseline_decision",
+                    severity="notice",
+                    message=(
+                        f"{operator} {'确认' if decision.accepted else '否决'}"
+                        f"基线第 {decision.generation.index} 代"
+                    ),
+                    accepted=decision.accepted,
+                    generation=decision.generation.index,
+                    operator=operator,
+                )
+            )
+            if decision.migration is not None:
+                self._publish_migration(decision.migration)
+            self._persist_baseline()
+            return report
+
+    def _publish_migration(self, migration: Migration) -> None:
+        """把一次基线换代写进审计（联锁自此按新代判）。"""
+
+        self.bus.publish(
+            Event.of(
+                "primary",
+                "primary",
+                "baseline_migration",
+                severity="notice",
+                message=(
+                    f"基线换代：第 {migration.previous.index} 代 → "
+                    f"第 {migration.generation.index} 代（{migration.reason}）"
+                ),
+                from_generation=migration.previous.index,
+                to_generation=migration.generation.index,
+                baseline_t_h=round(migration.generation.baseline_t_h, 2),
+                threshold_t_h=round(migration.generation.threshold_t_h, 2),
+                reason=migration.reason,
+            )
+        )
+
+    def baseline_report(self) -> dict:
+        """返回一次网基线代际报告（控制台展示与审计核对同源）。"""
+
+        report = self.network.baseline_report()
+        report["flow_t_h"] = round(self.network.flow_t_h(), 2)
+        report["low_flow"] = self.network.low_flow()
+        return report
+
+    def _pending_generation(self) -> int | None:
+        """返回待确认的基线代序号，没有则返回 ``None``。"""
+
+        pending = self.network.baseline_report()["pending"]
+        return None if pending is None else int(pending["index"])
 
     def retrofit_baseline(self, target_kpa: float) -> dict:
         """下发一次定压基线改造。"""
@@ -790,6 +951,7 @@ class Platform:
             "primary": {
                 **self.network.snapshot().as_dict(),
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),
+                "pending_generation": self._pending_generation(),
             },
             "secondary": self.secondary.snapshot().as_dict(),
             "pressure": self.pressure_report(),
